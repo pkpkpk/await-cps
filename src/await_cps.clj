@@ -3,7 +3,7 @@
    callback in the last two arguments, a pattern known as continuation-passing
    style (CPS) and popularised by Ring and clj-http."
   (:refer-clojure :exclude [await bound-fn])
-  (:require [await-cps.ioc :refer [coroutine]]))
+  (:require [await-cps.ioc :refer [invert]]))
 
 (defn ^:no-doc bound-fn
   [f]
@@ -35,15 +35,18 @@
                         (when (= before :async) (e' t))))]
     (apply f (concat args [resolve raise]))
     (let [run (bound-fn trampoline)
+          safe-r #(try (r %) (catch Throwable t (e t)))
+          other-thread-r #(run safe-r %)
+          other-thread-e #(run e %)
           [[before x]]
           (swap-vals! state
                       #(case (first %)
-                         :start [:async (partial run r) (partial run e)]
+                         :start [:async other-thread-r other-thread-e]
                          :resolved [:completed]
                          :raised [:completed]
                          %))]
       (case before
-        :resolved (partial r x)
+        :resolved (partial safe-r x)
         :raised (partial e x)
         nil))))
 
@@ -72,6 +75,21 @@
 (def ^:no-doc terminators
   {`await `do-await})
 
+(def ^:private cljs? (boolean (find-ns 'cljs.analyzer)))
+
+(defmacro async
+  "Like ((afn [] body*) resolve raise)."
+  [resolve raise & body]
+  (let [r (gensym)
+        e (gensym)]
+    `(letfn [(inverted# [~r ~e]
+               ~(invert {:r r :e e
+                         :terminators terminators
+                         :env &env
+                         :all-ex (if cljs? :default `Throwable)}
+                        `(do ~@body)))]
+       (run-async inverted# ~resolve ~raise))))
+
 (defmacro afn
   "Defines an asynchronous function. Declared arguments are extended with two
    continuation arguments of &resolve and &raise and these continuations will
@@ -93,24 +111,16 @@
         (if (symbol? a)
           [a b cs] [nil a bs])
         arg-names (map #(if (symbol? %) % (gensym)) args)]
-   `(fn ~@(when name [name]) [~@arg-names ~'&resolve ~'&raise]
-      (run-async (coroutine ~terminators
-                            (loop [~@(interleave args arg-names)] ~@body))
-                 ~'&resolve ~'&raise))))
+    `(fn ~@(when name [name]) [~@arg-names ~'&resolve ~'&raise]
+       (async ~'&resolve ~'&raise
+              (loop [~@(interleave args arg-names)] ~@body)))))
 
 (def
- ^{:macro true
-   :deprecated "0.1.9"
-   :doc "Deprecated - renamed to afn."}
+  ^{:macro true
+    :deprecated "0.1.9"
+    :doc "Deprecated - renamed to afn."}
   fn-async
   #'afn)
-
-(defmacro
- ^{:deprecated "0.1.12"
-   :doc "Deprecated - use ((afn [] body*) resolve raise)."}
-  async
-  [resolve raise & body]
- `((afn [] ~@body) ~resolve ~raise))
 
 (defmacro defn-async
   "Like defn, but the function defined is asynchronous (see afn)."
@@ -124,10 +134,9 @@
         arglists `'([~@args ~'&resolve ~'&raise])
         attrs (update attrs :arglists #(or % arglists))
         arg-names (map #(if (symbol? %) % (gensym)) args)]
-   `(defn ~name ~@(when doc [doc]) ~attrs [~@arg-names ~'&resolve ~'&raise]
-      (run-async (coroutine ~terminators
-                            (loop [~@(interleave args arg-names)] ~@body))
-                 ~'&resolve ~'&raise))))
+    `(defn ~name ~@(when doc [doc]) ~attrs [~@arg-names ~'&resolve ~'&raise]
+       (async ~'&resolve ~'&raise
+              (loop [~@(interleave args arg-names)] ~@body)))))
 
 (defn ^:no-doc either-promise
   [cps-fn & args]
@@ -136,7 +145,7 @@
         r #(deliver p [%])
         e #(deliver p [nil %])]
     (try (f r e)
-      (catch Throwable t (e t)))
+         (catch Throwable t (e t)))
     p))
 
 (defn await!
@@ -153,7 +162,7 @@
   (fn [r e]
     (future
       (let [[v t] (try [(f)]
-                    (catch Throwable t [nil t]))]
+                       (catch Throwable t [nil t]))]
         (if t
           (e t)
           (r v))))))
@@ -164,4 +173,4 @@
    IO from blocking the caller's thread.
    Use: (await (blocking (slurp \"a-very-long-file.txt\")))"
   [& body]
- `(blocking* (fn [] ~@body)))
+  `(blocking* (fn [] ~@body)))

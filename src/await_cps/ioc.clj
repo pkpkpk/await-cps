@@ -85,6 +85,21 @@
                  ~(invert (add-env-syms ctx (->> tail first (partition 2) (map first)))
                           `(do ~@(rest tail))))
 
+        let*
+        (let [[syncs [[sym asn] & others]]
+              (->> tail first (partition 2)
+                   (split-with #(not (has-terminators? % ctx))))
+              cont        (gensym "cont")
+              updated-ctx (add-env-syms ctx (map first syncs))]
+          `(let* [~@(mapcat identity syncs)]
+             ~(if asn
+                `(letfn [(~cont [~sym]
+                           ~(invert (add-env-syms (dissoc updated-ctx :sync-recur?) [sym])
+                                    `(let* [~@(mapcat identity others)]
+                                       ~@(rest tail))))]
+                   ~(invert (assoc updated-ctx :r cont) asn))
+                (invert updated-ctx `(do ~@(rest tail))))))
+
         do
         (let [[syncs [asn & others]] (split-with #(not (has-terminators? % ctx)) tail)
               cont (gensym "cont")]
@@ -97,44 +112,27 @@
                     (invert ctx asn)))
             `(~r ~form)))
 
-        ;let*
-        ;(let [[syncs [[sym asn] & others]]
-        ;      (->> tail first (partition 2)
-        ;           (split-with #(not (has-terminators? % ctx))))
-        ;      cont        (gensym "cont")
-        ;      updated-ctx (add-env-syms ctx (map first syncs))]
-        ;  `(let* [~@(mapcat identity syncs)]
-        ;     ~(if asn
-        ;        `(letfn [(~cont [~sym]
-        ;                   ~(invert (add-env-syms (dissoc updated-ctx :sync-recur?) [sym])
-        ;                            `(let* [~@(mapcat identity others)]
-        ;                               ~@(rest tail)))))]
-        ;           ~(invert (assoc updated-ctx :r cont) asn))
-        ;        (invert updated-ctx `(do ~@(rest tail))))))
+        loop*
+        (let [[binds & body] tail
+              bind-names (->> binds (partition 2) (map first))]
+          (cond
+            (has-terminators? binds ctx)
+            (invert ctx `(let [~@binds]
+                           (loop [~@(interleave bind-names bind-names)]
+                             ~@body)))
 
+            (has-terminators? body (dissoc ctx :recur-target))
+            (let [recur-target (gensym "recur")
+                  updated-ctx (add-env-syms ctx bind-names)]
+              `(letfn [(~recur-target [~@bind-names]
+                         (loop [~@(interleave bind-names bind-names)]
+                           ~(invert (assoc updated-ctx
+                                           :sync-recur? true
+                                           :recur-target recur-target)
+                                    `(do ~@body))))]
+                 (let [~@binds] (~recur-target ~@bind-names))))
 
-
-        ;loop*
-        ;(let [[binds & body] tail
-        ;      bind-names (->> binds (partition 2) (map first))]
-        ;  (cond
-        ;    (has-terminators? binds ctx)
-        ;    (invert ctx `(let [~@binds]
-        ;                   (loop [~@(interleave bind-names bind-names)]
-        ;                     ~@body)))
-        ;
-        ;    (has-terminators? body (dissoc ctx :recur-target))
-        ;    (let [recur-target (gensym "recur")
-        ;          updated-ctx (add-env-syms ctx bind-names)]
-        ;      `(letfn [(~recur-target [~@bind-names]
-        ;                 (loop [~@(interleave bind-names bind-names)]
-        ;                   ~(invert (assoc updated-ctx
-        ;                                   :sync-recur? true
-        ;                                   :recur-target recur-target)
-        ;                            `(do ~@body)))))]
-        ;         (let [~@binds] (~recur-target ~@bind-names))))
-        ;
-        ;    :else `(~r ~form)))
+            :else `(~r ~form)))
 
         recur
         (cond
@@ -227,10 +225,10 @@
 
       :else (throw (ex-info (str "Unsupported form [" form "]") {:form form})))))
 
-;(defmacro coroutine
-;  "Transforms a body into CPS form using provided terminators."
-;  [terms & body]
-;  (let [r (gensym) e (gensym)
-;        params   {:r r :e e :env &env :terminators terms}
-;        expanded (macroexpand-all `(do ~@body))]
-;    `(fn [~r ~e] ~(invert params expanded))))
+(defmacro coroutine
+  "Transforms a body into CPS form using provided terminators."
+  [terms & body]
+  (let [r (gensym) e (gensym)
+        params   {:r r :e e :env &env :terminators terms}
+        expanded (macroexpand-all `(do ~@body))]
+    `(fn [~r ~e] ~(invert params expanded))))

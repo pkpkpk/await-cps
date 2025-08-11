@@ -1,6 +1,8 @@
 (ns await-cps
+  "CLJC async/await syntax for CPS-style functions (callbacks as last two args: resolve, raise)."
   (:refer-clojure :exclude [await bound-fn])
-  (:require [await-cps.ioc :refer [coroutine]]))
+  #?(:clj  (:require [await-cps.ioc :refer [coroutine]]))
+  #?(:cljs (:require-macros [await-cps :refer [afn defn-async bound-fn]])))
 
 #?(:clj
    (defn ^:no-doc bound-fn
@@ -12,11 +14,9 @@
            (try
              (apply f args)
              (finally
-               (clojure.lang.Var/resetThreadBindingFrame call-site-frame))))))))
-#?(:cljs
-   (defmacro ^:no-doc bound-fn
-     [f]
-     `(cljs.core/bound-fn [& args#] (apply ~f args#))))
+               (clojure.lang.Var/resetThreadBindingFrame call-site-frame)))))))
+   :cljs
+   (def ^:no-doc bound-fn identity))
 
 #?(:clj
    (defn ^:no-doc swap-vals!* [a f] (clojure.core/swap-vals! a f))
@@ -55,8 +55,10 @@
                           :raised [:completed]
                           %))]
       (case before
-        :resolved (partial r x)
-        :raised   (partial e x)
+        ;; short-circuit sync completion: no extra trampoline hop
+        :resolved (do (r x) nil)
+        :raised   (do (e x) nil)
+        ;; async path keeps the prepared (partial run r/e) in state; do-await returns nil
         nil))))
 
 (defn ^:no-doc run-async
@@ -66,14 +68,16 @@
     nil))
 
 (defn await
+  "Signal suspension point. Must be used inside afn/defn-async bodies."
   [cps-fn & args]
-  (throw (new #?(:clj IllegalStateException :cljs js/Error)
-              "await called outside of asynchronous scope")))
+  (throw (new #?(:clj IllegalStateException :cljs js/Error) "await called outside of asynchronous scope")))
 
 (def ^:no-doc terminators
   {`await `do-await})
 
 (defmacro afn
+  "Defines an asynchronous function. Adds &resolve and &raise continuation params.
+   Executes synchronously until the first (await ...)."
   {:arglists '([name? [params*] body])}
   [& args]
   (let [[a & [b & cs :as bs]] args
@@ -85,19 +89,8 @@
                     (loop [~@(interleave params arg-names)] ~@body))
          ~'&resolve ~'&raise))))
 
-(def
-  ^{:macro true
-    :deprecated "0.1.9"}
-  fn-async
-  #'afn)
-
-(defmacro
-  ^{:deprecated "0.1.12"}
-  async
-  [resolve raise & body]
-  `((afn [] ~@body) ~resolve ~raise))
-
 (defmacro defn-async
+  "Like defn, but defines an asynchronous function (see afn)."
   {:arglists '([name doc-string? attr-map? [params*] body])}
   [name & args]
   (let [[a & [b & [c & ds :as cs] :as bs]] args
@@ -114,6 +107,8 @@
                     (loop [~@(interleave params arg-names)] ~@body))
          ~'&resolve ~'&raise))))
 
+;; ---------- JVM-only blocking helpers ----------
+
 #?(:clj
    (defn ^:no-doc either-promise
      [cps-fn & args]
@@ -127,6 +122,7 @@
 
 #?(:clj
    (defn await!
+     "Blocking variant (JVM only). Do not use inside asynchronous functions."
      [cps-fn & args]
      (let [[v t] @(apply either-promise cps-fn args)]
        (if t (throw t) v))))
@@ -141,5 +137,6 @@
 
 #?(:clj
    (defmacro blocking
+     "Runs body in a future and resumes within that future (JVM only)."
      [& body]
      `(blocking* (fn [] ~@body))))

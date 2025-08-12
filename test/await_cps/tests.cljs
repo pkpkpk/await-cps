@@ -6,15 +6,16 @@
 
 (deftest await-sync-short-circuits
   (testing "sync returns resolve in the same tick"
-    (let [events (atom nil)
-          r (fn [v] (reset! events [:r v]))
-          e (fn [e] (reset! events [:e e]))]
+    (let [state (atom nil)
+          r (fn [v] (reset! state v))
+          e (fn [e] (reset! state e))]
       (and
-       (is (nil? @events))
+       (is (nil? @state))
        (is (nil? ((afn [] (await sync-ok)) r e)))
-       (is (= [:r :ok] @events))
+       (is (= :ok @state))
        (is (nil? ((afn [] (throw (js/Error. "kaboom"))) r e)))
-       (is (instance? js/Error (second @events)))))))
+       (is (and (instance? js/Error @state)
+                (= "kaboom" (ex-message @state))))))))
 
 (defn async-ok [r e] (js/setTimeout #(r :ok) 0))
 (defn async-err [r e] (js/setTimeout #(e :err) 0))
@@ -34,7 +35,7 @@
 
 (defn-async async-test []
   (and
-   (is (= :ok (await async-ok)))
+   (is (= :ok (await async-ok)) "await returns ok value")
    (println "this should not print" (await async-err))))
 
 (deftest defn-async-test
@@ -43,4 +44,5 @@
           on-err #(do
                     (is (= :err %) "call to async-err takes on-err path")
                     (done))]
-      (is (nil? (async-test on-ok on-err)) "invocation return is always nil"))))
+      (testing "defn-async functions containing await calls"
+        (is (nil? (async-test on-ok on-err)) "invocation return is always nil")))))

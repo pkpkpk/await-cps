@@ -46,3 +46,25 @@
                     (done))]
       (testing "defn-async functions containing await calls"
         (is (nil? (async-test on-ok on-err)) "invocation return is always nil")))))
+
+(defn async-inc [n r e] (js/setTimeout #(r (inc n)) 0))
+
+(defn-async async-loop-increments [n]
+  (loop [i 0
+         acc []]
+    (if (< i n)
+      (recur (await async-inc i) (conj acc i))
+      acc)))
+
+(deftest await-async-loop
+  (let [n 10]
+    (async done
+      (testing "async loop increments the counter a few times"
+        (async-loop-increments n
+          (fn [result]
+            (is (= (vec (range n)) result))
+            (done))
+          (fn [t]
+            (throw (js/Error. (str "unexpected: " t)))))))))
+
+

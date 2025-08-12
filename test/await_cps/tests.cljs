@@ -67,4 +67,42 @@
           (fn [t]
             (throw (js/Error. (str "unexpected: " t)))))))))
 
+(defn async-yield [r e] (js/setTimeout #(r nil) 0))
+
+(declare even-async odd-async)
+
+(defn-async even-async [n *calls]
+  (swap! *calls inc)
+  (if (zero? n)
+    true
+    (do
+      (await async-yield)
+      (let [v (await odd-async (dec n) *calls)]
+        (not v)))))
+
+(defn-async odd-async [n *calls]
+  (swap! *calls inc)
+  (if (zero? n)
+    false
+    (do
+      (await async-yield)
+      (let [v (await even-async (dec n) *calls)]
+        (not v)))))
+
+(deftest await-mutual-recursion
+  (async done
+    (testing "mutual recursion across async boundaries preserves parity"
+      (let [fatal  (fn [t] (throw (js/Error. (str "unexpected: " t))))
+            *calls (atom 0)
+            final (fn [v]
+                     (and (is (false? v))
+                          (is (= @*calls 11)))
+                     (done))
+            step   (fn [v]
+                     (when (is (true? v))
+                       (is (nil? (odd-async 5 *calls final fatal)))
+                       (done)))]
+        (is (nil? (even-async 4 *calls step fatal)))))))
+
+
 

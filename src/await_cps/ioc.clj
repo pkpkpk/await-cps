@@ -1,16 +1,42 @@
 (ns ^:no-doc await-cps.ioc
-  (:require [riddley.walk :refer [macroexpand-all]]))
+  (:require [riddley.walk :refer [macroexpand-all]]
+            [clojure.pprint]))
 
 (defn var-name [env sym]
-  (when-let [v (and (symbol? sym) (resolve env sym))]
-    (let [nm (:name (meta v))
-          nsp (.getName ^clojure.lang.Namespace (:ns (meta v)))]
-      (symbol (name nsp) (name nm)))))
+  (when (symbol? sym)
+    ;; Don't qualify special forms or core symbols that shouldn't be qualified
+    (when-not (special-symbol? sym)
+      (if (:js-globals env)
+        ;; In ClojureScript, we need to check if this is a referred symbol
+        ;; Look in the environment's namespace info
+        (if (namespace sym)
+          sym
+          ;; For unqualified symbols, check if they're referred from another namespace
+          (let [ns-info (:ns env)
+                ns-name (:name ns-info)
+                uses (get ns-info :uses)
+                refers (get ns-info :refers)]
+            ;; Check if this symbol is referred from another namespace
+            (if-let [source-ns (get uses sym)]
+              ;; Found in uses - create qualified symbol with source namespace
+              (symbol (str source-ns) (name sym))
+              ;; Not found in uses, check refers or fall back to current namespace
+              (if-let [source-ns (get refers sym)]
+                (symbol (str source-ns) (name sym))
+                ;; Fall back to current namespace
+                (symbol (str ns-name) (name sym))))))
+        ;; In Clojure, use the existing resolution logic
+        (when-let [v (resolve env sym)]
+          (let [nm (:name (meta v))
+                nsp (.getName ^clojure.lang.Namespace (:ns (meta v)))]
+            (symbol (name nsp) (name nm))))))))
 
 (defn has-terminators?
- [form {:keys [terminators recur-target env] :as ctx}]
-  (let [sym (when (seq? form) (first form))]
-    (cond (contains? terminators (var-name env sym)) true
+  [form {:keys [terminators recur-target env] :as ctx}]
+  (let [sym (when (seq? form) (first form))
+        resolved-sym (var-name env sym)
+        has-term? (contains? terminators resolved-sym)]
+    (cond has-term? true
           (and recur-target (= 'recur sym)) true
           (= 'loop* sym) (some #(has-terminators? % (dissoc ctx :recur-target)) (rest form))
           (coll? form) (some #(has-terminators? % ctx) form)
@@ -32,12 +58,12 @@
             sync-bindings (->> syncs (filter second) (mapcat identity))
             async-binding (with-meta (gensym) (meta asn))
             cont (gensym "cont")]
-       `(let [~@sync-bindings]
-          (letfn [(~cont [~async-binding]
-                   ~(resolve-sequentially
-                      (dissoc ctx :sync-recur?) others
-                      #(then `[~@(map first syncs) ~async-binding ~@%])))]
-           ~(invert (assoc ctx :r cont) asn))))
+        `(let [~@sync-bindings]
+           (letfn [(~cont [~async-binding]
+                     ~(resolve-sequentially
+                        (dissoc ctx :sync-recur?) others
+                        #(then `[~@(map first syncs) ~async-binding ~@%])))]
+             ~(invert (assoc ctx :r cont) asn))))
       (then coll))))
 
 (defn add-env-syms [ctx syms]
@@ -60,27 +86,27 @@
         all-ex (if (:js-globals env) :default `Throwable)]
     (cond
       (not (has-terminators? form ctx))
-     `(~r ~form)
+      `(~r ~form)
 
       (and resolved (.isMacro resolved))
       (recur ctx (apply resolved form env tail))
 
-      (special-symbol? head)
+      (or (special-symbol? head) (= head 'let) (= head 'letfn) (= head 'loop) (= head 'fn))
       (case head
 
-        (quote var fn* def deftype* reify* clojure.core/import*)
-       `(~r ~form)
+        (quote var fn* fn def deftype* reify* clojure.core/import*)
+        `(~r ~form)
 
         if
         (let [[con left right & unexpected-others] tail
               cont (gensym "cont")]
           (if (has-terminators? con ctx)
             (let [ctx' (dissoc ctx :sync-recur?)]
-             `(letfn [(~cont [con#] (if con# ~(invert ctx' left)
-                                             ~(invert ctx' right)
-                                             ~@unexpected-others))]
-               ~(invert (assoc ctx :r cont) con)))
-           `(if ~con ~(invert ctx left) ~(invert ctx right))))
+              `(letfn [(~cont [con#] (if con# ~(invert ctx' left)
+                                              ~(invert ctx' right)
+                                              ~@unexpected-others))]
+                 ~(invert (assoc ctx :r cont) con)))
+            `(if ~con ~(invert ctx left) ~(invert ctx right))))
 
         case*
         (let [[ge shift mask default imap & args] tail
@@ -88,36 +114,97 @@
                               {} imap)]
           `(case* ~ge ~shift ~mask ~(invert ctx default) ~imap ~@args))
 
-        let*
-        (let [[syncs [[sym asn] & others]] (->> tail first (partition 2)
-                                                (split-with #(not (has-terminators? % ctx))))
+        let
+        ;; Handle ClojureScript let forms that don't expand to let*
+        (let [bindings-vec (first tail)
+              bindings-pairs (partition 2 bindings-vec)
+              [syncs [[sym asn] & others]] (split-with #(not (has-terminators? (second %) ctx)) bindings-pairs)
               cont (gensym "cont")
               updated-ctx (add-env-syms ctx (map first syncs))]
-         `(let* [~@(mapcat identity syncs)]
-           ~(if asn
-             `(letfn [(~cont [~sym]
-                       ~(invert (add-env-syms (dissoc updated-ctx :sync-recur?) [sym])
-                               `(let* [~@(mapcat identity others)]
-                                  ~@(rest tail))))]
-               ~(invert (assoc updated-ctx :r cont) asn))
-              (invert updated-ctx `(do ~@(rest tail))))))
+          (if asn
+            ;; We have an async binding
+            `(let [~@(mapcat identity syncs)]
+               (letfn [(~cont [async-value#]
+                         (let [~sym async-value#]
+                           ~(invert (add-env-syms (dissoc updated-ctx :sync-recur?) [sym])
+                                    (if (seq others)
+                                      `(let [~@(mapcat identity others)]
+                                         ~@(rest tail))
+                                      `(do ~@(rest tail))))))]
+                 ~(invert (assoc updated-ctx :r cont) asn)))
+            ;; No async bindings
+            `(let [~@(mapcat identity syncs)]
+               ~(invert updated-ctx `(do ~@(rest tail))))))
+
+        let*
+        (do
+          (let [bindings-vec (first tail)
+                bindings-pairs (partition 2 bindings-vec)
+                [syncs [[sym asn] & others]] (split-with #(not (has-terminators? (second %) ctx)) bindings-pairs)
+                cont (gensym "cont")
+                updated-ctx (add-env-syms ctx (map first syncs))
+                generated-form (if asn
+                                 ;; We have an async binding
+                                 `(let* [~@(mapcat identity syncs)]
+                                    (letfn [(~cont [async-value#]
+                                              (let* [~sym async-value#]
+                                                ~(invert (add-env-syms (dissoc updated-ctx :sync-recur?) [sym])
+                                                         (if (seq others)
+                                                           `(let* [~@(mapcat identity others)]
+                                                              ~@(rest tail))
+                                                           `(do ~@(rest tail))))))]
+                                      ~(invert (assoc updated-ctx :r cont) asn)))
+                                 ;; No async bindings
+                                 `(let* [~@(mapcat identity syncs)]
+                                    ~(invert updated-ctx `(do ~@(rest tail)))))
+                ]
+            generated-form))
+
+        letfn
+        ;; Handle ClojureScript letfn forms that don't expand to letfn*
+        `(letfn ~(first tail)
+           ~(invert (add-env-syms ctx (->> tail first (partition 2) (map first)))
+                    `(do ~@(rest tail))))
 
         letfn*
-       `(letfn* ~(first tail)
-         ~(invert (add-env-syms ctx (->> tail first (partition 2) (map first)))
-                 `(do ~@(rest tail))))
+        `(letfn* ~(first tail)
+                 ~(invert (add-env-syms ctx (->> tail first (partition 2) (map first)))
+                          `(do ~@(rest tail))))
 
         do
         (let [[syncs [asn & others]] (split-with #(not (has-terminators? % ctx)) tail)
               cont (gensym "cont")]
           (if asn
-           `(do ~@syncs
-                ~(if others
-                  `(letfn [(~cont [_#] ~(invert (dissoc ctx :sync-recur?)
-                                               `(do ~@others)))]
-                    ~(invert (assoc ctx :r cont) asn))
-                   (invert ctx asn)))
-           `(~r ~form)))
+            `(do ~@syncs
+                 ~(if others
+                    `(letfn [(~cont [_#] ~(invert (dissoc ctx :sync-recur?)
+                                                  `(do ~@others)))]
+                       ~(invert (assoc ctx :r cont) asn))
+                    (invert ctx asn)))
+            `(~r ~form)))
+
+        loop
+        ;; Handle ClojureScript loop forms that don't expand to loop*
+        (let [[binds & body] tail
+              bind-names (->> binds (partition 2) (map first))]
+          (cond
+            (has-terminators? binds ctx)
+            (invert ctx `(let [~@binds]
+                           (loop [~@(interleave bind-names bind-names)]
+                             ~@body)))
+
+            (has-terminators? body (dissoc ctx :recur-target))
+            (let [recur-target (gensym "recur")
+                  updated-ctx (add-env-syms ctx bind-names)]
+              `(letfn [(~recur-target [~@bind-names]
+                         (loop [~@(interleave bind-names bind-names)]
+                           ~(invert (assoc updated-ctx
+                                      :sync-recur? true
+                                      :recur-target recur-target)
+                                    `(do ~@body))))]
+                 (let [~@binds] (~recur-target ~@bind-names))))
+
+            :else `(~r ~form)))
 
         loop*
         (let [[binds & body] tail
@@ -126,18 +213,18 @@
             (has-terminators? binds ctx)
             (invert ctx `(let [~@binds]
                            (loop [~@(interleave bind-names bind-names)]
-                            ~@body)))
+                             ~@body)))
 
             (has-terminators? body (dissoc ctx :recur-target))
             (let [recur-target (gensym "recur")
                   updated-ctx (add-env-syms ctx bind-names)]
-             `(letfn [(~recur-target [~@bind-names]
-                        (loop [~@(interleave bind-names bind-names)]
-                         ~(invert (assoc updated-ctx
-                                         :sync-recur? true
-                                         :recur-target recur-target)
-                                 `(do ~@body))))]
-                (let [~@binds] (~recur-target ~@bind-names))))
+              `(letfn [(~recur-target [~@bind-names]
+                         (loop [~@(interleave bind-names bind-names)]
+                           ~(invert (assoc updated-ctx
+                                      :sync-recur? true
+                                      :recur-target recur-target)
+                                    `(do ~@body))))]
+                 (let [~@binds] (~recur-target ~@bind-names))))
 
             :else `(~r ~form)))
 
@@ -162,22 +249,22 @@
               fin-throw (gensym "finally-throw")
               cat (gensym "catch")
               v (gensym) t (gensym)]
-         `(letfn [(~fin-do [~v ~t]
-                    (try ~(invert ctx `(do ~@finally (if ~t (throw ~t) ~v)))
-                      (catch ~all-ex t# (~e t#))))
-                  (~fin [v#] (~fin-do v# nil))
-                  (~fin-throw [t#] (~fin-do nil t#))
-                  (~cat [t#]
-                    (try
-                      (try (throw t#)
-                       ~@(map (fn [[sym cls bnd & body]]
-                               `(~sym ~cls ~bnd
-                                       ~(invert (assoc (add-env-syms ctx [bnd]) :r fin :e fin-throw)
-                                               `(do ~@body))))
-                              catches))
-                      (catch ~all-ex t# (~fin-do nil t#))))]
-            (try ~(invert (assoc ctx :r fin :e cat) `(do ~@body))
-              (catch ~all-ex t# (~cat t#)))))
+          `(letfn [(~fin-do [~v ~t]
+                     (try ~(invert ctx `(do ~@finally (if ~t (throw ~t) ~v)))
+                          (catch ~all-ex t# (~e t#))))
+                   (~fin [v#] (~fin-do v# nil))
+                   (~fin-throw [t#] (~fin-do nil t#))
+                   (~cat [t#]
+                     (try
+                       (try (throw t#)
+                            ~@(map (fn [[sym cls bnd & body]]
+                                     `(~sym ~cls ~bnd
+                                        ~(invert (assoc (add-env-syms ctx [bnd]) :r fin :e fin-throw)
+                                                 `(do ~@body))))
+                                   catches))
+                       (catch ~all-ex t# (~fin-do nil t#))))]
+             (try ~(invert (assoc ctx :r fin :e cat) `(do ~@body))
+                  (catch ~all-ex t# (~cat t#)))))
 
         throw
         (resolve-sequentially ctx tail (fn [args] `(throw ~@args)))
@@ -203,9 +290,9 @@
                                         subject)]
           (if (and object (has-terminators? object ctx))
             (resolve-sequentially ctx [object args]
-              (fn [[object args]] `(~r (set! (. ~object ~@field-args) ~@args))))
+                                  (fn [[object args]] `(~r (set! (. ~object ~@field-args) ~@args))))
             (resolve-sequentially ctx args
-              (fn [args] `(~r (set! ~subject ~@args))))))
+                                  (fn [args] `(~r (set! ~subject ~@args))))))
 
         (throw (ex-info (str "Unsupported special symbol [" head "]")
                         {:unknown-special-form head :form form})))
@@ -213,8 +300,8 @@
       (contains? terminators (var-name env head))
       (let [handler (terminators (var-name env head))]
         (resolve-sequentially ctx (rest form)
-          (fn [args] `(letfn [(safe-r# [v#] (try (~r v#) (catch ~all-ex t# (~e t#))))]
-                        (~handler safe-r# ~e ~@args)))))
+                              (fn [args] `(letfn [(safe-r# [v#] (try (~r v#) (catch ~all-ex t# (~e t#))))]
+                                            (~handler safe-r# ~e ~@args)))))
 
       (seq? form)
       (resolve-sequentially ctx form (fn [form] `(~r ~(seq form))))
@@ -246,5 +333,5 @@
   [terms & body]
   (let [r (gensym) e (gensym)
         params {:r r :e e :env &env :terminators terms}
-        expanded (macroexpand-all `(do ~@body))]
-   `(fn [~r ~e] ~(invert params expanded))))
+        expanded (macroexpand-all (cons 'do body))]
+    `(fn [~r ~e] ~(invert params expanded))))

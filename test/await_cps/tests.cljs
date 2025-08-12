@@ -32,3 +32,15 @@
                           (is (nil? ((afn [] (await async-err)) fatal expect-err)))))]
         (is (nil? ((afn [] (await async-ok)) expect-ok fatal)))))))
 
+(defn-async async-test []
+  (and
+   (is (= :ok (await async-ok)))
+   (println "this should not print" (await async-err))))
+
+(deftest defn-async-test
+  (async done
+    (let [on-ok  #(throw (js/Error. (str "unexpected: " %)))
+          on-err #(do
+                    (is (= :err %) "call to async-err takes on-err path")
+                    (done))]
+      (is (nil? (async-test on-ok on-err)) "invocation return is always nil"))))

@@ -44,7 +44,10 @@
 (defn ^:no-doc run-async
   [f resolve raise]
   (let [run (bound-fn trampoline)]
-    (run f resolve raise)
+    (try
+      (run f resolve raise)
+      (catch :default e
+        (raise e)))
     nil))
 
 (defn await
